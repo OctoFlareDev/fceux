@@ -21,6 +21,11 @@ cd %PROJECT_ROOT%\output
 if %ERRORLEVEL% NEQ 0 EXIT /B 1
 ..\vc\zip -X -9 -u -r ..\vc\%ZIP_FILENAME% fceux.chm taseditor.chm palettes luaScripts tools
 if %ERRORLEVEL% NEQ 0 EXIT /B 1
+cd %PROJECT_ROOT%
+if exist Sounds (
+   vc\zip -X -9 -u -r vc\%ZIP_FILENAME% Sounds
+   if %ERRORLEVEL% NEQ 0 EXIT /B 1
+)
 
 cd %PROJECT_ROOT%
 

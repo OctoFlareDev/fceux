@@ -25,20 +25,37 @@
 
 #include "../common/configSys.h"
 #include "../../utils/memory.h"
+#include "../../sound.h"
 
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
 
 extern Config *g_config;
 
-static volatile int *s_Buffer = 0;
+static volatile uint32_t *s_Buffer = 0;
 static unsigned int s_BufferSize;
 static unsigned int s_BufferRead;
 static unsigned int s_BufferWrite;
 static volatile unsigned int s_BufferIn;
 
 static int s_mute = 0;
+
+static inline uint32_t packStereo(int16 left, int16 right)
+{
+	return (uint16_t)left | ((uint32_t)(uint16_t)right << 16);
+}
+
+static inline int16 unpackLeft(uint32_t packed)
+{
+	return (int16)(packed & 0xFFFF);
+}
+
+static inline int16 unpackRight(uint32_t packed)
+{
+	return (int16)((packed >> 16) & 0xFFFF);
+}
 
 
 /**
@@ -49,14 +66,17 @@ fillaudio(void *udata,
 			uint8 *stream,
 			int len)
 {
-	static int16_t sample = 0;
+	static int16 sampleLeft = 0;
+	static int16 sampleRight = 0;
 	int16 *tmps = (int16*)stream;
-	len >>= 1;
+	len >>= 2;
 	while (len)
 	{
 		if (s_BufferIn)
 		{
-			sample = s_Buffer[s_BufferRead];
+			const uint32_t packed = s_Buffer[s_BufferRead];
+			sampleLeft = unpackLeft(packed);
+			sampleRight = unpackRight(packed);
 			s_BufferRead = (s_BufferRead + 1) % s_BufferSize;
 			s_BufferIn--;
 		} else {
@@ -66,8 +86,8 @@ fillaudio(void *udata,
 			//bufStarveDetected = 1;
 		}
 
-		*tmps = sample;
-		tmps++;
+		*tmps++ = sampleLeft;
+		*tmps++ = sampleRight;
 		len--;
 	}
 }
@@ -109,7 +129,7 @@ InitSound()
 
 	spec.freq = soundrate;
 	spec.format = AUDIO_S16SYS;
-	spec.channels = 1;
+	spec.channels = 2;
 	spec.samples = 512;
 	spec.callback = fillaudio;
 	spec.userdata = 0;
@@ -122,7 +142,7 @@ InitSound()
 		s_BufferSize = spec.samples * 2;
 	}
 
-	s_Buffer = (int *)FCEU_dmalloc(sizeof(int) * s_BufferSize);
+	s_Buffer = (uint32_t *)FCEU_dmalloc(sizeof(uint32_t) * s_BufferSize);
 
 	if (!s_Buffer)
 	{
@@ -186,6 +206,7 @@ WriteSound(int32 *buf,
 	if (EmulationPaused == 0)
    {
 		int waitCount = 0;
+		int frameIndex = 0;
 
 		while(Count)
 		{
@@ -200,7 +221,9 @@ WriteSound(int32 *buf,
 				}
 			}
 
-			s_Buffer[s_BufferWrite] = *buf;
+			int16 left, right;
+			FCEU_NoteBlockStereoFrame(frameIndex, *buf, &left, &right);
+			s_Buffer[s_BufferWrite] = packStereo(left, right);
 			Count--;
 			s_BufferWrite = (s_BufferWrite + 1) % s_BufferSize;
             
@@ -209,6 +232,7 @@ WriteSound(int32 *buf,
 			SDL_UnlockAudio();
             
 			buf++;
+			frameIndex++;
 		}
    }
 }

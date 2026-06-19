@@ -235,7 +235,7 @@ std::string GetFilename (const char *title, bool save, const char *filter)
 		FCEUI_ToggleEmulationPause ();
 	std::string fname = "";
 
-#ifdef WIN32
+#if defined(WIN32) && !defined(__SDL__)
 	OPENFILENAME ofn;		// common dialog box structure
 	char szFile[260];		// buffer for file name
 	HWND hwnd;			// owner window
@@ -505,6 +505,7 @@ static void KeyboardCommands (void)
 	//
 	
 	// Alt-M to toggle Main Menu Visibility
+#ifdef _GTK
 	if ( is_alt )
 	{
 		if (keyonly (M))
@@ -512,6 +513,7 @@ static void KeyboardCommands (void)
 			toggleMenuVis();
 		}
 	}
+#endif
 
 	// Toggle Movie auto-backup
 	if ( is_shift )

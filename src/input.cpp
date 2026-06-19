@@ -36,7 +36,7 @@
 #include "fds.h"
 #include "driver.h"
 
-#ifdef WIN32
+#ifdef __WIN_DRIVER__
 #include "drivers/win/main.h"
 #include "drivers/win/memwatch.h"
 #include "drivers/win/cheat.h"

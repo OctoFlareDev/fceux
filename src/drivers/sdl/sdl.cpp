@@ -28,6 +28,7 @@
 
 #ifdef WIN32
 #include <windows.h>
+#include <commdlg.h>
 #endif
 
 #ifdef _GTK
@@ -81,6 +82,29 @@ int dendy;
 bool swapDuty;
 
 static bool luaScriptRunning = false;
+
+#if defined(WIN32) && !defined(_GTK)
+static std::string Win32SelectRom()
+{
+	char fileName[MAX_PATH * 4] = "";
+	OPENFILENAMEA ofn;
+	memset(&ofn, 0, sizeof(ofn));
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = NULL;
+	ofn.lpstrFile = fileName;
+	ofn.nMaxFile = sizeof(fileName);
+	ofn.lpstrFilter =
+		"NES/Famicom files\0*.nes;*.fds;*.nsf;*.unf;*.unif;*.zip;*.7z\0"
+		"All files\0*.*\0";
+	ofn.nFilterIndex = 1;
+	ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+	ofn.lpstrTitle = "Open ROM";
+
+	if (!GetOpenFileNameA(&ofn))
+		return std::string();
+	return std::string(fileName);
+}
+#endif
 
 // -Video Modes Tag- : See --special
 static const char *DriverUsage=
@@ -575,7 +599,7 @@ int main(int argc, char *argv[])
 
 	FCEUD_Message("Starting " FCEU_NAME_AND_VERSION "...\n");
 
-#ifdef WIN32
+#if defined(WIN32) && !SDL_VERSION_ATLEAST(2, 0, 0)
 	/* Taken from win32 sdl_main.c */
 	SDL_SetModuleHandle(GetModuleHandle(NULL));
 #endif
@@ -796,15 +820,25 @@ int main(int argc, char *argv[])
 		return 0;
 	}
    
+	std::string selectedRom;
 
 	// if we're not compiling w/ the gui, exit if a rom isn't specified
 #ifndef _GTK
 	if(romIndex <= 0) {
+#ifdef WIN32
+		selectedRom = Win32SelectRom();
+		if (selectedRom.empty())
+		{
+			SDL_Quit();
+			return 0;
+		}
+#else
 		
 		ShowUsage(argv[0]);
 		FCEUD_Message("\nError parsing command line arguments\n");
 		SDL_Quit();
 		return -1;
+#endif
 	}
 #endif
 	
@@ -855,16 +889,18 @@ int main(int argc, char *argv[])
 	}
 #endif
 
-	if(romIndex >= 0)
+	if(romIndex >= 0 || !selectedRom.empty())
 	{
+		const char *romPath = selectedRom.empty() ? argv[romIndex] : selectedRom.c_str();
+
 		// load the specified game
-		error = LoadGame(argv[romIndex]);
+		error = LoadGame(romPath);
 		if(error != 1) {
 			DriverKill();
 			SDL_Quit();
 			return -1;
 		}
-		g_config->setOption("SDL.LastOpenFile", argv[romIndex]);
+		g_config->setOption("SDL.LastOpenFile", romPath);
 		g_config->save();
 
 	}
@@ -1135,4 +1171,3 @@ FCEUFILE* FCEUD_OpenArchive(ArchiveScanRecord& asr, std::string& fname, std::str
 FCEUFILE* FCEUD_OpenArchiveIndex(ArchiveScanRecord& asr, std::string &fname, int innerIndex, int* userCancel) { return 0; }
 FCEUFILE* FCEUD_OpenArchive(ArchiveScanRecord& asr, std::string& fname, std::string* innerFilename, int* userCancel) { return 0; }
 ArchiveScanRecord FCEUD_ScanArchive(std::string fname) { return ArchiveScanRecord(); }
-

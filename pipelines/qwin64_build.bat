@@ -88,6 +88,9 @@ copy %PROJECT_ROOT%\src\drivers\win\lua\x64\lua5.1.dll  bin\.
 copy %SDL_INSTALL_PREFIX%\lib\x64\SDL2.dll  bin\.
 copy %LIBARCHIVE_INSTALL_PREFIX%\bin\*.dll  bin\.
 copy %FFMPEG_INSTALL_PREFIX%\bin\*.dll  bin\.
+if exist "%PROJECT_ROOT%\Sounds" (
+   xcopy /E /I /Y "%PROJECT_ROOT%\Sounds" "bin\Sounds"
+)
 
 windeployqt  --no-compiler-runtime  bin\qfceux.exe
 

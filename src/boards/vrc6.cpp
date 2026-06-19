@@ -85,6 +85,7 @@ static DECLFW(VRC6SW) {
 		if (sfun[1]) sfun[1]();
 	} else if (A >= 0xB000 && A <= 0xB002) {
 		vpsg2[A & 3] = V;
+		FCEU_NoteBlockSetVRC6Saw(vpsg2[1] | ((vpsg2[2] & 15) << 8), vpsg2[2] & 0x80);
 		if (sfun[2]) sfun[2]();
 	}
 }
@@ -221,6 +222,10 @@ static void DoSawV(void) {
 	end = (SOUNDTS << 16) / soundtsinc;
 	if (end <= start) return;
 	cvbc[2] = end;
+	if (FCEU_NoteBlockReplacementEnabled()) {
+		FCEU_NoteBlockSetVRC6Saw(vpsg2[1] | ((vpsg2[2] & 15) << 8), vpsg2[2] & 0x80);
+		return;
+	}
 
 	if (vpsg2[2] & 0x80) {
 		static int32 saw1phaseacc = 0;
@@ -290,6 +295,12 @@ static void DoSawVHQ(void) {
 	static uint8 b3 = 0;
 	static int32 phaseacc = 0;
 	int32 V;
+
+	if (FCEU_NoteBlockReplacementEnabled()) {
+		FCEU_NoteBlockSetVRC6Saw(vpsg2[1] | ((vpsg2[2] & 15) << 8), vpsg2[2] & 0x80);
+		cvbc[2] = SOUNDTS;
+		return;
+	}
 
 	if (vpsg2[2] & 0x80) {
 		for (V = cvbc[2]; V < (int)SOUNDTS; V++) {

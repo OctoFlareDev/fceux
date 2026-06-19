@@ -72,6 +72,10 @@ void FCEUSND_LoadState(int version);
 void FCEU_SoundCPUHook(int);
 void Write_IRQFM (uint32 A, uint8 V); //mbg merge 7/17/06 brought over from latest mmbuild
 
+void FCEU_NoteBlockSetVRC6Saw(uint32 period, bool active);
+bool FCEU_NoteBlockReplacementEnabled(void);
+void FCEU_NoteBlockStereoFrame(int index, int32 mono, int16 *left, int16 *right);
+
 void LogDPCM(int romaddress, int dpcmsize);
 
 typedef struct {

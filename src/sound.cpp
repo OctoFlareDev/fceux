@@ -31,6 +31,34 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <fstream>
+
+#ifdef _USE_LIBAV
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/error.h>
+#include <libavutil/samplefmt.h>
+#include <libswresample/swresample.h>
+}
+#endif
+
+#ifdef _WIN32
+#include <direct.h>
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 static uint32 wlookup1[32];
 static uint32 wlookup2[203];
@@ -147,6 +175,741 @@ static uint32 ChannelBC[5];
 
 //savestate sync hack stuff
 int movieSyncHackOn=0,resetDMCacc=0,movieConvertOffset1,movieConvertOffset2;
+
+int CheckFreq(uint32 cf, uint8 sr);
+
+namespace {
+
+enum NoteBlockSound {
+	NB_BANJO = 0,
+	NB_GUITAR,
+	NB_PLING,
+	NB_HARP,
+	NB_DBASS,
+	NB_SDRUM,
+	NB_COUNT
+};
+
+enum NoteBlockChannelId {
+	NB_CH_PULSE1 = 0,
+	NB_CH_PULSE2,
+	NB_CH_TRIANGLE,
+	NB_CH_NOISE,
+	NB_CH_VRC6_SAW,
+	NB_CH_COUNT
+};
+
+struct NoteBlockSample {
+	const char *name;
+	double baseFreq;
+	std::vector<float> pcm;
+};
+
+struct NoteBlockVoice {
+	const NoteBlockSample *sample = nullptr;
+	double pos = 0.0;
+	double step = 1.0;
+	double leftGain = 1.0;
+	double rightGain = 1.0;
+	int delay = 0;
+	uint32 age = 0;
+};
+
+struct NoteBlockChannel {
+	bool active = false;
+	NoteBlockSound sound = NB_HARP;
+	double freq = 440.0;
+	double gain = 1.0;
+	int untilNext = 0;
+	bool panLeft = true;
+};
+
+static NoteBlockSample NoteBlockSamples[NB_COUNT] = {
+	{ "banjo", 369.9944227116344, {} },
+	{ "guitar", 369.9944227116344, {} },
+	{ "pling", 369.9944227116344, {} },
+	{ "harp", 369.9944227116344, {} },
+	{ "dbass", 184.9972113558172, {} },
+	{ "sdrum", 369.9944227116344, {} }
+};
+
+static std::vector<NoteBlockVoice> NoteBlockVoices;
+static NoteBlockChannel NoteBlockChannels[NB_CH_COUNT];
+static std::vector<int32> NoteBlockMono;
+static std::vector<int32> NoteBlockStereoLeft;
+static std::vector<int32> NoteBlockStereoRight;
+static int NoteBlockStereoCount = 0;
+static int NoteBlockLoadedRate = 0;
+static bool NoteBlockLoadTried = false;
+static bool NoteBlockReady = false;
+static uint32 NoteBlockAge = 1;
+static uint32 NoteBlockRand = 0x1234abcd;
+
+static bool NoteBlockFileExists(const std::string &path)
+{
+#ifdef _WIN32
+	const DWORD attrs = GetFileAttributesA(path.c_str());
+	return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+#else
+	struct stat st;
+	return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+#endif
+}
+
+static bool NoteBlockEndsWith(const std::string &path, const char *suffix)
+{
+	const size_t pathLen = path.size();
+	const size_t suffixLen = strlen(suffix);
+	return pathLen >= suffixLen && path.compare(pathLen - suffixLen, suffixLen, suffix) == 0;
+}
+
+static void NoteBlockAddSearchPath(std::vector<std::string> &paths, const std::string &base)
+{
+	if (base.empty()) return;
+	const std::string direct = base + "/Sounds";
+	paths.push_back(direct);
+	paths.push_back(base + "/Contents/Resources/Sounds");
+	paths.push_back(base + "/../Resources/Sounds");
+
+	std::string cur = base;
+	for (int i = 0; i < 8; i++)
+	{
+		const size_t slash = cur.find_last_of('/');
+		if (slash == std::string::npos || slash == 0) break;
+		cur.resize(slash);
+		paths.push_back(cur + "/Sounds");
+	}
+}
+
+static std::vector<std::string> NoteBlockSearchPaths()
+{
+	std::vector<std::string> paths;
+	char cwd[4096];
+#ifdef _WIN32
+	if (_getcwd(cwd, sizeof(cwd)))
+#else
+	if (getcwd(cwd, sizeof(cwd)))
+#endif
+		NoteBlockAddSearchPath(paths, cwd);
+
+#ifdef _WIN32
+	char exe[4096];
+	const DWORD exeLen = GetModuleFileNameA(NULL, exe, sizeof(exe));
+	if (exeLen > 0 && exeLen < sizeof(exe))
+	{
+		std::string dir(exe);
+		std::replace(dir.begin(), dir.end(), '\\', '/');
+		const size_t slash = dir.find_last_of('/');
+		if (slash != std::string::npos)
+		{
+			dir.resize(slash);
+			NoteBlockAddSearchPath(paths, dir);
+		}
+	}
+#elif defined(__APPLE__)
+	char exe[4096];
+	uint32_t exeLen = sizeof(exe);
+	if (_NSGetExecutablePath(exe, &exeLen) == 0)
+	{
+		char resolved[4096];
+		const char *path = realpath(exe, resolved) ? resolved : exe;
+		std::string dir(path);
+		const size_t slash = dir.find_last_of('/');
+		if (slash != std::string::npos)
+		{
+			dir.resize(slash);
+			NoteBlockAddSearchPath(paths, dir);
+		}
+	}
+#endif
+
+	return paths;
+}
+
+static std::string NoteBlockFindSoundFile(const char *name)
+{
+	const std::vector<std::string> paths = NoteBlockSearchPaths();
+	for (const std::string &path : paths)
+	{
+		const std::string wav = path + "/" + name + ".wav";
+		if (NoteBlockFileExists(wav))
+			return wav;
+		const std::string ogg = path + "/" + name + ".ogg";
+		if (NoteBlockFileExists(ogg))
+			return ogg;
+	}
+	return std::string();
+}
+
+static uint16 NoteBlockReadLE16(const uint8 *p)
+{
+	return (uint16)p[0] | ((uint16)p[1] << 8);
+}
+
+static uint32 NoteBlockReadLE32(const uint8 *p)
+{
+	return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+}
+
+static bool NoteBlockDecodeWav(const std::string &path, int targetRate, std::vector<float> &out)
+{
+	std::ifstream in(path.c_str(), std::ios::binary);
+	if (!in)
+		return false;
+	std::vector<uint8> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+	if (bytes.size() < 44 || memcmp(bytes.data(), "RIFF", 4) != 0 || memcmp(bytes.data() + 8, "WAVE", 4) != 0)
+		return false;
+
+	uint16 format = 0;
+	uint16 channels = 0;
+	uint32 sampleRate = 0;
+	uint16 blockAlign = 0;
+	uint16 bitsPerSample = 0;
+	const uint8 *sampleData = nullptr;
+	uint32 sampleDataSize = 0;
+
+	size_t pos = 12;
+	while (pos + 8 <= bytes.size())
+	{
+		const uint8 *chunk = bytes.data() + pos;
+		const uint32 chunkSize = NoteBlockReadLE32(chunk + 4);
+		const size_t dataPos = pos + 8;
+		if (dataPos + chunkSize > bytes.size())
+			break;
+
+		if (memcmp(chunk, "fmt ", 4) == 0 && chunkSize >= 16)
+		{
+			format = NoteBlockReadLE16(bytes.data() + dataPos);
+			channels = NoteBlockReadLE16(bytes.data() + dataPos + 2);
+			sampleRate = NoteBlockReadLE32(bytes.data() + dataPos + 4);
+			blockAlign = NoteBlockReadLE16(bytes.data() + dataPos + 12);
+			bitsPerSample = NoteBlockReadLE16(bytes.data() + dataPos + 14);
+		}
+		else if (memcmp(chunk, "data", 4) == 0)
+		{
+			sampleData = bytes.data() + dataPos;
+			sampleDataSize = chunkSize;
+		}
+
+		pos = dataPos + chunkSize + (chunkSize & 1);
+	}
+
+	if (!sampleData || !sampleDataSize || !sampleRate || !channels || !blockAlign)
+		return false;
+	if (!((format == 1 && bitsPerSample == 16) || (format == 3 && bitsPerSample == 32)))
+		return false;
+
+	const uint32 frameCount = sampleDataSize / blockAlign;
+	if (!frameCount)
+		return false;
+
+	std::vector<float> mono(frameCount);
+	for (uint32 frame = 0; frame < frameCount; frame++)
+	{
+		const uint8 *src = sampleData + frame * blockAlign;
+		double sum = 0.0;
+		for (uint16 ch = 0; ch < channels; ch++)
+		{
+			if (format == 1)
+			{
+				const int16 v = (int16)NoteBlockReadLE16(src + ch * 2);
+				sum += (double)v / 32768.0;
+			}
+			else
+			{
+				float v;
+				memcpy(&v, src + ch * 4, sizeof(v));
+				sum += v;
+			}
+		}
+		mono[frame] = (float)(sum / channels);
+	}
+
+	const uint32 outCount = std::max<uint32>(1, (uint32)std::ceil((double)mono.size() * targetRate / sampleRate));
+	out.resize(outCount);
+	for (uint32 i = 0; i < outCount; i++)
+	{
+		const double srcPos = (double)i * sampleRate / targetRate;
+		const uint32 idx = (uint32)srcPos;
+		const double frac = srcPos - idx;
+		const float a = idx < mono.size() ? mono[idx] : 0.0f;
+		const float b = idx + 1 < mono.size() ? mono[idx + 1] : 0.0f;
+		out[i] = (float)(a + (b - a) * frac);
+	}
+	return !out.empty();
+}
+
+#ifdef _USE_LIBAV
+static bool NoteBlockDecodeOgg(const std::string &path, int targetRate, std::vector<float> &out)
+{
+	AVFormatContext *fmt = nullptr;
+	AVCodecContext *codec = nullptr;
+	SwrContext *swr = nullptr;
+	AVPacket *packet = nullptr;
+	AVFrame *frame = nullptr;
+	bool ok = false;
+	int streamIndex = -1;
+
+	if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0)
+		goto done;
+	if (avformat_find_stream_info(fmt, nullptr) < 0)
+		goto done;
+
+	streamIndex = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+	if (streamIndex < 0)
+		goto done;
+
+	{
+		AVStream *stream = fmt->streams[streamIndex];
+		const AVCodec *decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+		if (!decoder)
+			goto done;
+		codec = avcodec_alloc_context3(decoder);
+		if (!codec)
+			goto done;
+		if (avcodec_parameters_to_context(codec, stream->codecpar) < 0)
+			goto done;
+		if (avcodec_open2(codec, decoder, nullptr) < 0)
+			goto done;
+	}
+
+	{
+		AVChannelLayout outLayout;
+		av_channel_layout_default(&outLayout, 1);
+		if (swr_alloc_set_opts2(&swr, &outLayout, AV_SAMPLE_FMT_FLT, targetRate,
+				&codec->ch_layout, codec->sample_fmt, codec->sample_rate, 0, nullptr) < 0)
+		{
+			av_channel_layout_uninit(&outLayout);
+			goto done;
+		}
+		av_channel_layout_uninit(&outLayout);
+		if (swr_init(swr) < 0)
+			goto done;
+	}
+
+	packet = av_packet_alloc();
+	frame = av_frame_alloc();
+	if (!packet || !frame)
+		goto done;
+
+	while (av_read_frame(fmt, packet) >= 0)
+	{
+		if (packet->stream_index == streamIndex && avcodec_send_packet(codec, packet) >= 0)
+		{
+			while (avcodec_receive_frame(codec, frame) == 0)
+			{
+				const int outCount = (int)av_rescale_rnd(
+					swr_get_delay(swr, codec->sample_rate) + frame->nb_samples,
+					targetRate, codec->sample_rate, AV_ROUND_UP);
+				if (outCount > 0)
+				{
+					const size_t oldSize = out.size();
+					out.resize(oldSize + outCount);
+					uint8_t *dst[] = { reinterpret_cast<uint8_t*>(out.data() + oldSize) };
+					const int got = swr_convert(swr, dst, outCount,
+						(const uint8_t**)frame->extended_data, frame->nb_samples);
+					if (got < 0)
+						goto done;
+					out.resize(oldSize + got);
+				}
+				av_frame_unref(frame);
+			}
+		}
+		av_packet_unref(packet);
+	}
+
+	if (avcodec_send_packet(codec, nullptr) >= 0)
+	{
+		while (avcodec_receive_frame(codec, frame) == 0)
+		{
+			const int outCount = (int)av_rescale_rnd(
+				swr_get_delay(swr, codec->sample_rate) + frame->nb_samples,
+				targetRate, codec->sample_rate, AV_ROUND_UP);
+			if (outCount > 0)
+			{
+				const size_t oldSize = out.size();
+				out.resize(oldSize + outCount);
+				uint8_t *dst[] = { reinterpret_cast<uint8_t*>(out.data() + oldSize) };
+				const int got = swr_convert(swr, dst, outCount,
+					(const uint8_t**)frame->extended_data, frame->nb_samples);
+				if (got < 0)
+					goto done;
+				out.resize(oldSize + got);
+			}
+			av_frame_unref(frame);
+		}
+	}
+
+	ok = !out.empty();
+
+done:
+	if (frame) av_frame_free(&frame);
+	if (packet) av_packet_free(&packet);
+	if (swr) swr_free(&swr);
+	if (codec) avcodec_free_context(&codec);
+	if (fmt) avformat_close_input(&fmt);
+	return ok;
+}
+#endif
+
+static bool NoteBlockEnsureLoaded()
+{
+	if (!FSettings.SndRate)
+		return false;
+	if (NoteBlockReady && NoteBlockLoadedRate == FSettings.SndRate)
+		return true;
+	if (NoteBlockLoadTried && NoteBlockLoadedRate == FSettings.SndRate)
+		return NoteBlockReady;
+
+	NoteBlockLoadTried = true;
+	NoteBlockLoadedRate = FSettings.SndRate;
+	NoteBlockReady = false;
+	NoteBlockVoices.assign(64, NoteBlockVoice());
+	NoteBlockMono.clear();
+	NoteBlockStereoLeft.clear();
+	NoteBlockStereoRight.clear();
+	NoteBlockStereoCount = 0;
+
+	for (int i = 0; i < NB_COUNT; i++)
+	{
+		NoteBlockSamples[i].pcm.clear();
+		const std::string path = NoteBlockFindSoundFile(NoteBlockSamples[i].name);
+		if (path.empty())
+		{
+			FCEU_printf("Note block sound missing: %s.wav or %s.ogg\n", NoteBlockSamples[i].name, NoteBlockSamples[i].name);
+			return false;
+		}
+		if (NoteBlockEndsWith(path, ".wav"))
+		{
+			if (!NoteBlockDecodeWav(path, FSettings.SndRate, NoteBlockSamples[i].pcm))
+			{
+				FCEU_printf("Unable to decode note block sound: %s\n", path.c_str());
+				return false;
+			}
+			continue;
+		}
+#ifdef _USE_LIBAV
+		if (!NoteBlockDecodeOgg(path, FSettings.SndRate, NoteBlockSamples[i].pcm))
+		{
+			FCEU_printf("Unable to decode note block sound: %s\n", path.c_str());
+			return false;
+		}
+#else
+		FCEU_printf("Note block sound mode requires libav/ffmpeg support.\n");
+		return false;
+#endif
+	}
+
+	FCEU_printf("Note block sound replacement enabled.\n");
+	NoteBlockReady = true;
+	return true;
+}
+
+static int NoteBlockRandomDelaySamples()
+{
+	if (!FSettings.SndRate)
+		return 0;
+	NoteBlockRand = NoteBlockRand * 1664525U + 1013904223U;
+	const int maxDelay = std::max(1, (int)(FSettings.SndRate / 1000));
+	return (int)(NoteBlockRand % (uint32)(maxDelay + 1));
+}
+
+static void NoteBlockTrigger(NoteBlockSound which, double freq, double leftGain, double rightGain, int delay)
+{
+	if (which < 0 || which >= NB_COUNT || freq <= 0.0 || !NoteBlockEnsureLoaded())
+		return;
+
+	const NoteBlockSample *sample = &NoteBlockSamples[which];
+	if (sample->pcm.empty())
+		return;
+
+	NoteBlockVoice *voice = nullptr;
+	for (NoteBlockVoice &candidate : NoteBlockVoices)
+	{
+		if (!candidate.sample || candidate.pos >= candidate.sample->pcm.size())
+		{
+			voice = &candidate;
+			break;
+		}
+	}
+	if (!voice)
+	{
+		voice = &NoteBlockVoices[0];
+		for (NoteBlockVoice &candidate : NoteBlockVoices)
+			if (candidate.age < voice->age)
+				voice = &candidate;
+	}
+
+	voice->sample = sample;
+	voice->pos = 0.0;
+	voice->step = freq / sample->baseFreq;
+	if (voice->step < 0.125) voice->step = 0.125;
+	if (voice->step > 8.0) voice->step = 8.0;
+	voice->leftGain = leftGain;
+	voice->rightGain = rightGain;
+	voice->delay = (delay > 0 ? delay : 0) + NoteBlockRandomDelaySamples();
+	voice->age = NoteBlockAge++;
+}
+
+static int32 NoteBlockClampSample(int64 v)
+{
+	if (v > 32767) return 32767;
+	if (v < -32768) return -32768;
+	return (int32)v;
+}
+
+static void NoteBlockRender(int count)
+{
+	NoteBlockStereoCount = count > 0 ? count : 0;
+	if ((int)NoteBlockStereoLeft.size() != NoteBlockStereoCount)
+	{
+		NoteBlockMono.resize(NoteBlockStereoCount);
+		NoteBlockStereoLeft.resize(NoteBlockStereoCount);
+		NoteBlockStereoRight.resize(NoteBlockStereoCount);
+	}
+	std::fill(NoteBlockMono.begin(), NoteBlockMono.end(), 0);
+	std::fill(NoteBlockStereoLeft.begin(), NoteBlockStereoLeft.end(), 0);
+	std::fill(NoteBlockStereoRight.begin(), NoteBlockStereoRight.end(), 0);
+
+	if (count <= 0 || !NoteBlockReady)
+		return;
+
+	const double scale = 10500.0;
+	for (NoteBlockVoice &voice : NoteBlockVoices)
+	{
+		if (!voice.sample)
+			continue;
+
+		int start = 0;
+		if (voice.delay > 0)
+		{
+			if (voice.delay >= count)
+			{
+				voice.delay -= count;
+				continue;
+			}
+			start = voice.delay;
+			voice.delay = 0;
+		}
+
+		const std::vector<float> &pcm = voice.sample->pcm;
+		for (int i = start; i < count; i++)
+		{
+			const int idx = (int)voice.pos;
+			if (idx < 0 || idx >= (int)pcm.size())
+			{
+				voice.sample = nullptr;
+				break;
+			}
+			const int next = idx + 1;
+			const double frac = voice.pos - idx;
+			const double a = pcm[idx];
+			const double b = next < (int)pcm.size() ? pcm[next] : 0.0;
+			const double sample = a + (b - a) * frac;
+			NoteBlockStereoLeft[i] += (int32)std::lrint(sample * voice.leftGain * scale);
+			NoteBlockStereoRight[i] += (int32)std::lrint(sample * voice.rightGain * scale);
+			voice.pos += voice.step;
+		}
+	}
+
+	for (int i = 0; i < count; i++)
+	{
+		NoteBlockMono[i] = NoteBlockClampSample(((int64)NoteBlockStereoLeft[i] + NoteBlockStereoRight[i]) / 2);
+		WaveFinal[i] = NoteBlockClampSample((int64)WaveFinal[i] + NoteBlockMono[i]);
+	}
+}
+
+static int NoteBlockSubtickSamples()
+{
+	if (!FSettings.SndRate)
+		return 1;
+	const int ticksPerSecond = PAL ? 50 : 60;
+	return std::max(1, (int)(FSettings.SndRate / ticksPerSecond));
+}
+
+static void NoteBlockSetChannel(NoteBlockChannelId id, bool active, NoteBlockSound sound, double freq, double gain)
+{
+	NoteBlockChannel &channel = NoteBlockChannels[id];
+	if (!active)
+	{
+		channel.active = false;
+		channel.untilNext = 0;
+		channel.panLeft = true;
+		return;
+	}
+
+	channel.sound = sound;
+	channel.freq = freq > 0.0 ? freq : channel.freq;
+	channel.gain = gain;
+	if (!channel.active)
+	{
+		channel.active = true;
+		channel.untilNext = NoteBlockSubtickSamples();
+		channel.panLeft = true;
+		NoteBlockTrigger(channel.sound, channel.freq, channel.gain, channel.gain, 0);
+	}
+}
+
+static void NoteBlockAdvanceChannels(int count)
+{
+	if (count <= 0 || !NoteBlockEnsureLoaded())
+		return;
+
+	const int interval = NoteBlockSubtickSamples();
+	for (NoteBlockChannel &channel : NoteBlockChannels)
+	{
+		if (!channel.active)
+			continue;
+
+		for (int offset = channel.untilNext; offset < count; offset += interval)
+		{
+			const double gain = channel.gain * 0.5;
+			if (channel.panLeft)
+				NoteBlockTrigger(channel.sound, channel.freq, gain, 0.0, offset);
+			else
+				NoteBlockTrigger(channel.sound, channel.freq, 0.0, gain, offset);
+			channel.panLeft = !channel.panLeft;
+			channel.untilNext = offset + interval;
+		}
+		channel.untilNext -= count;
+		if (channel.untilNext < 0)
+			channel.untilNext = 0;
+	}
+}
+
+static double NoteBlockCpuClock()
+{
+	return PAL ? (double)PAL_CPU : (double)NTSC_CPU;
+}
+
+static double NoteBlockMasterGain()
+{
+	return FSettings.SoundVolume > 0 ? (double)FSettings.SoundVolume / 150.0 : 0.0;
+}
+
+static double NoteBlockEnvelopeGain(int amp, uint32 volume)
+{
+	double gain = (double)amp / 15.0;
+	gain *= (double)volume / 256.0;
+	gain *= NoteBlockMasterGain();
+	if (gain < 0.0) gain = 0.0;
+	if (gain > 1.5) gain = 1.5;
+	return gain;
+}
+
+static bool NoteBlockPulseState(int channel, NoteBlockSound &sound, double &freq, double &gain)
+{
+	const int period = curfreq[channel];
+	if (!(EnabledChannels & (1 << channel)) || period < 8 || period > 0x7ff)
+		return false;
+	if (!CheckFreq(period, PSG[(channel << 2) | 0x1]) || !lengthcount[channel])
+		return false;
+
+	int amp = (EnvUnits[channel].Mode & 0x1) ? EnvUnits[channel].Speed : EnvUnits[channel].decvolume;
+	if (amp <= 0)
+		return false;
+
+	const int duty = (PSG[channel << 2] & 0xC0) >> 6;
+	sound = NB_PLING;
+	switch (duty & 3)
+	{
+	case 0: sound = NB_BANJO; break;  // 12.5%
+	case 1: sound = NB_GUITAR; break; // 25%
+	case 2: sound = NB_PLING; break;  // 50%
+	case 3: sound = NB_GUITAR; break; // 75%
+	}
+
+	freq = NoteBlockCpuClock() / (16.0 * (period + 1));
+	gain = NoteBlockEnvelopeGain(amp, channel ? FSettings.Square2Volume : FSettings.Square1Volume);
+	return gain > 0.0;
+}
+
+static bool NoteBlockTriangleState(NoteBlockSound &sound, double &freq, double &gain)
+{
+	if (!(EnabledChannels & 0x4))
+		return false;
+	const int period = PSG[0xa] | ((PSG[0xb] & 7) << 8);
+	if (period <= 0 || period > 0x7ff || !lengthcount[2] || !TriCount)
+		return false;
+	sound = NB_HARP;
+	freq = NoteBlockCpuClock() / (32.0 * (period + 1));
+	gain = NoteBlockEnvelopeGain(15, FSettings.TriangleVolume);
+	return gain > 0.0;
+}
+
+static double NoteBlockNoiseFreq()
+{
+	const int noiseIndex = PSG[0xE] & 0xF;
+	const uint32 *table = PAL ? NoiseFreqTablePAL : NoiseFreqTableNTSC;
+	const double period = (double)table[noiseIndex];
+	const double reference = (double)table[8];
+	double ratio = std::pow(reference / period, 0.25);
+
+	if (PSG[0xE] & 0x80)
+		ratio *= 1.25;
+	ratio *= std::pow(2.0, -5.0 / 12.0);
+	if (ratio < 0.35) ratio = 0.35;
+	if (ratio > 3.0) ratio = 3.0;
+	return NoteBlockSamples[NB_SDRUM].baseFreq * ratio;
+}
+
+static bool NoteBlockNoiseState(NoteBlockSound &sound, double &freq, double &gain)
+{
+	if (!(EnabledChannels & 0x8) || !lengthcount[3])
+		return false;
+	int amp = (EnvUnits[2].Mode & 0x1) ? EnvUnits[2].Speed : EnvUnits[2].decvolume;
+	if (amp <= 0)
+		return false;
+	sound = NB_SDRUM;
+	freq = NoteBlockNoiseFreq();
+	gain = NoteBlockEnvelopeGain(amp, FSettings.NoiseVolume);
+	return gain > 0.0;
+}
+
+static void NoteBlockUpdateAPUChannels()
+{
+	NoteBlockSound sound = NB_HARP;
+	double freq = 0.0;
+	double gain = 0.0;
+
+	NoteBlockSetChannel(NB_CH_PULSE1, NoteBlockPulseState(0, sound, freq, gain), sound, freq, gain);
+	NoteBlockSetChannel(NB_CH_PULSE2, NoteBlockPulseState(1, sound, freq, gain), sound, freq, gain);
+	NoteBlockSetChannel(NB_CH_TRIANGLE, NoteBlockTriangleState(sound, freq, gain), sound, freq, gain);
+	NoteBlockSetChannel(NB_CH_NOISE, NoteBlockNoiseState(sound, freq, gain), sound, freq, gain);
+}
+
+} // namespace
+
+bool FCEU_NoteBlockReplacementEnabled(void)
+{
+	return NoteBlockEnsureLoaded();
+}
+
+void FCEU_NoteBlockSetVRC6Saw(uint32 period, bool active)
+{
+	if (!active || period > 0x0fff)
+	{
+		NoteBlockSetChannel(NB_CH_VRC6_SAW, false, NB_DBASS, 0.0, 0.0);
+		return;
+	}
+	const double freq = NoteBlockCpuClock() / (14.0 * (period + 1));
+	NoteBlockSetChannel(NB_CH_VRC6_SAW, true, NB_DBASS, freq, std::min(1.2, NoteBlockMasterGain()));
+}
+
+void FCEU_NoteBlockStereoFrame(int index, int32 mono, int16 *left, int16 *right)
+{
+	int32 l = NoteBlockClampSample(mono);
+	int32 r = NoteBlockClampSample(mono);
+	if (index >= 0 && index < NoteBlockStereoCount)
+	{
+		l = NoteBlockClampSample((int64)l - NoteBlockMono[index]);
+		r = NoteBlockClampSample((int64)r - NoteBlockMono[index]);
+		l = NoteBlockClampSample((int64)l + NoteBlockStereoLeft[index]);
+		r = NoteBlockClampSample((int64)r + NoteBlockStereoRight[index]);
+	}
+	*left = (int16)l;
+	*right = (int16)r;
+}
 
 #ifdef WIN32
 extern volatile int datacount, undefinedcount;
@@ -602,6 +1365,9 @@ static INLINE void RDoSQ(int x)		//Int x decides if this is Square Wave 1 or 2
    int32 cf;
    int32 rc;
 
+   if (FCEU_NoteBlockReplacementEnabled())
+    goto endit;
+
    if(curfreq[x]<8 || curfreq[x]>0x7ff)
     goto endit;
    if(!CheckFreq(curfreq[x],PSG[(x<<2)|0x1]))
@@ -678,6 +1444,7 @@ static void RDoSQLQ(void)
    end=(SOUNDTS<<16)/soundtsinc;
    if(end<=start) return;
    ChannelBC[0]=end;
+   if (FCEU_NoteBlockReplacementEnabled()) return;
 
    for(x=0;x<2;x++)
    {
@@ -764,6 +1531,12 @@ static void RDoTriangle(void)
  uint32 V; //mbg merge 7/17/06 made uitn32
  int32 tcout;
 
+ if (FCEU_NoteBlockReplacementEnabled())
+ {
+  ChannelBC[2]=SOUNDTS;
+  return;
+ }
+
  tcout=(tristep&0xF);
  if(!(tristep&0x10)) tcout^=0xF;
  tcout=(tcout*3) << 16;  //(tcout<<1);
@@ -828,6 +1601,12 @@ static void RDoTriangleNoisePCMLQ(void)
 
    if(!lengthcount[2] || !TriCount || freq[0]<=4)
     inie[0]=0;
+   if (FCEU_NoteBlockReplacementEnabled())
+   {
+    inie[0]=0;
+    inie[1]=0;
+    tcout=0;
+   }
 
    freq[0]<<=17;
    if(EnvUnits[2].Mode&0x1)
@@ -844,6 +1623,8 @@ static void RDoTriangleNoisePCMLQ(void)
 
    if(!lengthcount[3])
     amptab[0]=inie[1]=0;  /* Quick hack speedup, set inie[1] to 0 */
+   if (FCEU_NoteBlockReplacementEnabled())
+    amptab[0]=0;
 
    noiseout=amptab[(nreg>>0xe)&1];
 
@@ -950,6 +1731,12 @@ static void RDoNoise(void)
  uint32 V; //mbg merge 7/17/06 made uint32
  int32 outo;
  uint32 amptab[2];
+
+ if (FCEU_NoteBlockReplacementEnabled())
+ {
+  ChannelBC[3]=SOUNDTS;
+  return;
+ }
 
  if(EnvUnits[2].Mode&0x1)
   amptab[0]=EnvUnits[2].Speed;
@@ -1104,6 +1891,10 @@ int FlushEmulateSound(void)
   }
   inbuf=end;
 
+  NoteBlockUpdateAPUChannels();
+  NoteBlockAdvanceChannels(end);
+  NoteBlockRender(end);
+
   FCEU_WriteWaveData(WaveFinal, end); /* This function will just return
 				    if sound recording is off. */
   return(end);
@@ -1127,6 +1918,10 @@ void FCEUSND_Reset(void)
 	fhcnt=fhinc;
 	fcnt=0;
 	nreg=1;
+	for (x = 0; x < NB_CH_COUNT; x++)
+		NoteBlockChannels[x] = NoteBlockChannel();
+	for (NoteBlockVoice &voice : NoteBlockVoices)
+		voice.sample = nullptr;
 
 	for(x=0;x<2;x++)
 	{

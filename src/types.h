@@ -144,7 +144,7 @@ typedef uint32_t uint32;
 
 #endif
 
-#if defined(WIN32) && !defined(__QT_DRIVER__) && !defined(__WIN_DRIVER__)
+#if defined(WIN32) && !defined(__QT_DRIVER__) && !defined(__WIN_DRIVER__) && !defined(__SDL__)
 #define  __WIN_DRIVER__
 #endif
 

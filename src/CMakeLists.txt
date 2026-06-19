@@ -4,12 +4,24 @@ set( APP_NAME fceux)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
+option(FCEUX_SDL_FRONTEND "Build the classic SDL frontend instead of the Qt frontend" OFF)
 
 if (${PUBLIC_RELEASE})
 	add_definitions( -DPUBLIC_RELEASE=1 )
 endif()
 
-if ( ${QT6} )
+if (FCEUX_SDL_FRONTEND)
+	set( QT 0 )
+	set( Qt FCEUX_NO_QT )
+	set( FCEUX_NO_QTWidgets_LIBRARIES "" )
+	set( FCEUX_NO_QTHelp_LIBRARIES "" )
+	set( FCEUX_NO_QTQml_LIBRARIES "" )
+	set( FCEUX_NO_QTUiTools_LIBRARIES "" )
+	set( FCEUX_NO_QTNetwork_LIBRARIES "" )
+	set( FCEUX_NO_QTOpenGL_LIBRARIES "" )
+	set( FCEUX_NO_QTOpenGLWidgets_LIBRARIES "" )
+	message( STATUS "GUI Frontend: classic SDL")
+elseif ( ${QT6} )
 	set( QT 6 )
 endif()
 
@@ -39,7 +51,9 @@ if ( ${FCEU_PROFILER_ENABLE} )
 	add_definitions( -D__FCEU_PROFILER_ENABLE__ )
 endif()
 
-if ( ${QT} EQUAL 6 )
+if (FCEUX_SDL_FRONTEND)
+	add_definitions( -D__SDL__ )
+elseif ( ${QT} EQUAL 6 )
 	message( STATUS "GUI Frontend: Qt6")
 	set( Qt Qt6 )
 	find_package( Qt6 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets)
@@ -122,32 +136,56 @@ endif()
 
 if(WIN32)
      find_package(OpenGL REQUIRED)
-     #find_package(Qt5 COMPONENTS Widgets OpenGL REQUIRED)
-     #add_definitions( ${Qt5Widgets_DEFINITIONS}  )
-     #include_directories( ${Qt5Widgets_INCLUDE_DIRS} )
-     add_definitions( -DMSVC -D_CRT_SECURE_NO_WARNINGS )
-     add_definitions( -D__SDL__  -D__QT_DRIVER__  -DQT_DEPRECATED_WARNINGS )
+     add_definitions( -D_CRT_SECURE_NO_WARNINGS )
+     add_definitions( -D__SDL__ )
+     add_definitions( -DPSS_STYLE=2 )
      add_definitions( -DFCEUDEF_DEBUGGER )
-     add_definitions( -D_USE_LIBARCHIVE )
-     add_definitions( /wd4267 /wd4244 )
-     #add_definitions( /wd4018 ) # Integer comparison sign mismatch warnings
-     include_directories( ${SDL_INSTALL_PREFIX}/include )
-     include_directories( ${LIBARCHIVE_INSTALL_PREFIX}/include )
      include_directories( ${CMAKE_CURRENT_SOURCE_DIR}/drivers/win/zlib )
-     set( OPENGL_LDFLAGS  OpenGL::GL )
-     set( SDL2_LDFLAGS  ${SDL_INSTALL_PREFIX}/lib/x64/SDL2.lib )
-     set( LIBARCHIVE_LDFLAGS  ${LIBARCHIVE_INSTALL_PREFIX}/lib/archive.lib )
-     set( SYS_LIBS  wsock32 ws2_32 vfw32 Htmlhelp )
      set(APP_ICON_RESOURCES_WINDOWS  ${CMAKE_SOURCE_DIR}/icons/fceux.rc )
+
+     if (MINGW)
+        add_definitions( -DNEED_MINGW_HACKS )
+        include_directories( ${SDL_INSTALL_PREFIX}/x86_64-w64-mingw32/include/SDL2 )
+        set( OPENGL_LDFLAGS opengl32 )
+        set( SDL2_LDFLAGS
+             mingw32
+             ${SDL_INSTALL_PREFIX}/x86_64-w64-mingw32/lib/libSDL2main.a
+             ${SDL_INSTALL_PREFIX}/x86_64-w64-mingw32/lib/libSDL2.dll.a )
+        set( SYS_LIBS wsock32 ws2_32 winmm imm32 version setupapi ole32 oleaut32 uuid comdlg32 )
+     else()
+        #find_package(Qt5 COMPONENTS Widgets OpenGL REQUIRED)
+        #add_definitions( ${Qt5Widgets_DEFINITIONS}  )
+        #include_directories( ${Qt5Widgets_INCLUDE_DIRS} )
+        add_definitions( -DMSVC )
+        if (NOT FCEUX_SDL_FRONTEND)
+           add_definitions( -D__QT_DRIVER__  -DQT_DEPRECATED_WARNINGS )
+        endif()
+        add_definitions( -D_USE_LIBARCHIVE )
+        add_definitions( /wd4267 /wd4244 )
+        #add_definitions( /wd4018 ) # Integer comparison sign mismatch warnings
+        include_directories( ${SDL_INSTALL_PREFIX}/include )
+        include_directories( ${LIBARCHIVE_INSTALL_PREFIX}/include )
+        set( OPENGL_LDFLAGS  OpenGL::GL )
+        set( SDL2_LDFLAGS  ${SDL_INSTALL_PREFIX}/lib/x64/SDL2.lib )
+        set( LIBARCHIVE_LDFLAGS  ${LIBARCHIVE_INSTALL_PREFIX}/lib/archive.lib )
+        set( SYS_LIBS  wsock32 ws2_32 vfw32 Htmlhelp )
+     endif()
 
      if ( ${USE_LIBAV} )
         add_definitions( -D_USE_LIBAV ${LIBAV_CFLAGS} )
         include_directories( ${FFMPEG_INSTALL_PREFIX}/include )
-        set( LIBAV_LDFLAGS  ${FFMPEG_INSTALL_PREFIX}/lib/avcodec.lib
-        	                 ${FFMPEG_INSTALL_PREFIX}/lib/avformat.lib
-                	         ${FFMPEG_INSTALL_PREFIX}/lib/avutil.lib
-                        	 ${FFMPEG_INSTALL_PREFIX}/lib/swscale.lib
-                        	 ${FFMPEG_INSTALL_PREFIX}/lib/swresample.lib )
+        if (MINGW)
+           set( LIBAV_LDFLAGS  ${FFMPEG_INSTALL_PREFIX}/lib/avcodec.lib
+                                ${FFMPEG_INSTALL_PREFIX}/lib/avformat.lib
+                                ${FFMPEG_INSTALL_PREFIX}/lib/avutil.lib
+                                ${FFMPEG_INSTALL_PREFIX}/lib/swresample.lib )
+        else()
+           set( LIBAV_LDFLAGS  ${FFMPEG_INSTALL_PREFIX}/lib/avcodec.lib
+                                ${FFMPEG_INSTALL_PREFIX}/lib/avformat.lib
+                                ${FFMPEG_INSTALL_PREFIX}/lib/avutil.lib
+                                ${FFMPEG_INSTALL_PREFIX}/lib/swscale.lib
+                                ${FFMPEG_INSTALL_PREFIX}/lib/swresample.lib )
+        endif()
      endif()
 
 else(WIN32)
@@ -698,7 +736,26 @@ set(SRC_DRIVERS_SDL
   ${CMAKE_CURRENT_SOURCE_DIR}/drivers/Qt/TasEditor/markers.cpp
 )
 
-set(SOURCES ${SRC_CORE} ${SRC_DRIVERS_COMMON} ${SRC_DRIVERS_SDL})
+set(SRC_DRIVERS_CLASSIC_SDL
+  ${CMAKE_CURRENT_SOURCE_DIR}/drivers/sdl/sdl.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/drivers/sdl/config.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/drivers/sdl/input.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/drivers/sdl/sdl-sound.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/drivers/sdl/sdl-video.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/drivers/sdl/sdl-joystick.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/drivers/sdl/sdl-throttle.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/drivers/sdl/unix-netplay.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/drivers/sdl/glxwin_stub.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/drivers/sdl/frontend_stubs.cpp
+)
+
+if (FCEUX_SDL_FRONTEND)
+	set(SRC_FRONTEND ${SRC_DRIVERS_CLASSIC_SDL})
+else()
+	set(SRC_FRONTEND ${SRC_DRIVERS_SDL})
+endif()
+
+set(SOURCES ${SRC_CORE} ${SRC_DRIVERS_COMMON} ${SRC_FRONTEND})
 
 # Put build timestamp into BUILD_TS environment variable and from there into
 # the FCEUX_BUILD_TIMESTAMP preprocessor definition.
@@ -707,7 +764,7 @@ set(SOURCES ${SRC_CORE} ${SRC_DRIVERS_COMMON} ${SRC_DRIVERS_SDL})
 string(TIMESTAMP BUILD_TS "%H:%M:%S  %b %d %Y" UTC)
 add_definitions( -DFCEUX_BUILD_TIMESTAMP=\"${BUILD_TS}\" )
 
-if (WIN32)
+if (WIN32 AND NOT CMAKE_CROSSCOMPILING)
 add_custom_command( 
 	OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/fceux_git_info.cpp  
 	COMMAND  ${CMAKE_SOURCE_DIR}/scripts/genGitHdr.bat  ${CMAKE_CURRENT_BINARY_DIR} 
@@ -754,6 +811,13 @@ target_link_libraries( ${APP_NAME}
 	${LUA_LDFLAGS} ${X264_LDFLAGS} ${X265_LDFLAGS} ${LIBAV_LDFLAGS}
  	${SYS_LIBS}
 )
+
+if(APPLE AND EXISTS "${CMAKE_SOURCE_DIR}/Sounds")
+	add_custom_command(TARGET ${APP_NAME} POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E copy_directory
+			"${CMAKE_SOURCE_DIR}/Sounds"
+			"$<TARGET_BUNDLE_CONTENT_DIR:${APP_NAME}>/Resources/Sounds")
+endif()
 
 if(NOT MSVC)
 	# Add minizip subdirectory so #include<unzip.h> works without the "minizip" subdirectory in the directive

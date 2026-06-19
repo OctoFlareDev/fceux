@@ -77,8 +77,14 @@ static int s_paletterefresh = 1;
 
 extern bool MaxSpeed;
 
+#ifdef _GTK
 extern unsigned int gtk_draw_area_width;
 extern unsigned int gtk_draw_area_height;
+#else
+static unsigned int gtk_draw_area_width = GLX_NES_WIDTH * 2;
+static unsigned int gtk_draw_area_height = 480;
+static uint32_t s_sdlPixbuf[GLX_NES_WIDTH * GLX_NES_HEIGHT];
+#endif
 
 static int sdl_win_width = 0;
 static int sdl_win_height = 0;
@@ -107,7 +113,11 @@ KillVideo()
 		glx_shm->clear_pixbuf();
 	}
 
+#ifdef _GTK
 	destroy_gui_video();
+#else
+	destroy_gtk3_sdl_video();
+#endif
 
 	// return failure if the video system was not initialized
 	if (s_inited == 0)
@@ -181,16 +191,43 @@ int InitVideo(FCEUGI *gi)
 	s_sponge = 0;
 	s_exs = 1.0;
 	s_eys = 1.0;
-	xres = gtk_draw_area_width;
-	yres = gtk_draw_area_height;
 	// check the starting, ending, and total scan lines
 
 	FCEUI_GetCurrentVidSystem(&s_srendline, &s_erendline);
 	s_tlines = s_erendline - s_srendline + 1;
 
+#ifdef _GTK
+	xres = gtk_draw_area_width;
+	yres = gtk_draw_area_height;
+#else
+	g_config->getOption("SDL.XScale", &s_exs);
+	g_config->getOption("SDL.YScale", &s_eys);
+	if (s_exs <= 0.0)
+		s_exs = 1.0;
+	if (s_eys <= 0.0)
+		s_eys = 1.0;
+	xres = (int)(NWIDTH * s_exs);
+	yres = (int)(s_tlines * s_eys);
+	if (xres < GLX_NES_WIDTH)
+		xres = GLX_NES_WIDTH;
+	if (yres < s_tlines)
+		yres = s_tlines;
+	gtk_draw_area_width = xres;
+	gtk_draw_area_height = yres;
+#endif
+
 	g_config->getOption("SDL.VideoDriver", &vdSel);
 
+#ifdef _GTK
 	init_gui_video( (videoDriver_t)vdSel );
+#else
+	(void)vdSel;
+	if (init_gtk3_sdl_video() < 0)
+	{
+		KillVideo();
+		return -1;
+	}
+#endif
 
 	s_inited = 1;
 
@@ -341,17 +378,28 @@ BlitScreen(uint8 *XBuf)
 	// XXX soules - not entirely sure why this is being done yet
 	XBuf += s_srendline * 256;
 
+#ifdef _GTK
 	dest = (uint8*)getGuiPixelBuffer( &w, &h, &pitch );
 
 	glx_shm->ncol    = NWIDTH;
 	glx_shm->nrow    = s_tlines;
 	glx_shm->pitch   = pitch;
+#else
+	dest = (uint8*)s_sdlPixbuf;
+	w = GLX_NES_WIDTH;
+	h = GLX_NES_HEIGHT;
+	pitch = GLX_NES_WIDTH * sizeof(uint32_t);
+#endif
 
 	if ( dest == NULL ) return;
 
 	Blit8ToHigh(XBuf + NOFFSET, dest, NWIDTH, s_tlines, pitch, 1, 1);
 
+#ifdef _GTK
 	guiPixelBufferReDraw();
+#else
+	gtk3_sdl_render();
+#endif
 
 #ifdef CREATE_AVI
  { int fps = FCEUI_GetDesiredFPS();
@@ -463,6 +511,7 @@ void FCEUI_SetAviDisableMovieMessages(bool disable)
 //*****************************************************************************
 int init_gtk3_sdl_video( void )
 {
+#ifdef _GTK
 	GdkWindow *gdkWin = gtk_widget_get_window(evbox);
 	Window win;
 	int sdlRendW, sdlRendH;
@@ -538,6 +587,69 @@ int init_gtk3_sdl_video( void )
 	sdl_win_height = sdlRendH;
 
 	return 0;
+#else
+	int sdlRendW, sdlRendH;
+	int vsyncEnabled = 0;
+
+	if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
+	{
+		printf("[SDL] Failed to initialize video subsystem.\n");
+		return -1;
+	}
+	else
+	{
+		printf("Initialized SDL Video Subsystem\n");
+	}
+
+	uint32_t windowFlags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+	if (s_fullscreen)
+		windowFlags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+
+	sdlWindow = SDL_CreateWindow("FCEUX", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+		gtk_draw_area_width, gtk_draw_area_height, windowFlags);
+	if (sdlWindow == NULL)
+	{
+		printf("[SDL] Failed to create window: %s\n", SDL_GetError());
+		return -1;
+	}
+
+	uint32_t baseFlags = vsyncEnabled ? SDL_RENDERER_PRESENTVSYNC : 0;
+
+	sdlRenderer = SDL_CreateRenderer(sdlWindow, -1, baseFlags | SDL_RENDERER_ACCELERATED);
+
+	if (sdlRenderer == NULL)
+	{
+		printf("[SDL] Failed to create accelerated renderer.\n");
+
+		printf("[SDL] Attempting to create software renderer...\n");
+
+		sdlRenderer = SDL_CreateRenderer(sdlWindow, -1, baseFlags | SDL_RENDERER_SOFTWARE);
+
+		if (sdlRenderer == NULL)
+		{
+			printf("[SDL] Failed to create software renderer: %s\n", SDL_GetError());
+			return -1;
+		}
+	}
+
+	SDL_GetRendererOutputSize(sdlRenderer, &sdlRendW, &sdlRendH);
+
+	printf("[SDL] Renderer Output Size: %i x %i \n", sdlRendW, sdlRendH);
+
+	sdlTexture = SDL_CreateTexture(sdlRenderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
+		GLX_NES_WIDTH, GLX_NES_HEIGHT);
+
+	if (sdlTexture == NULL)
+	{
+		printf("[SDL] Failed to create texture: %i x %i: %s\n", GLX_NES_WIDTH, GLX_NES_HEIGHT, SDL_GetError());
+		return -1;
+	}
+
+	sdl_win_width = sdlRendW;
+	sdl_win_height = sdlRendH;
+
+	return 0;
+#endif
 }
 
 //*****************************************************************************
@@ -554,6 +666,12 @@ int destroy_gtk3_sdl_video(void)
 		printf("Destroying SDL Renderer...\n");
 		SDL_DestroyRenderer(sdlRenderer);
 		sdlRenderer = NULL;
+	}
+	if (sdlWindow)
+	{
+		printf("Destroying SDL Window...\n");
+		SDL_DestroyWindow(sdlWindow);
+		sdlWindow = NULL;
 	}
 	//SDL_QuitSubSystem(SDL_INIT_VIDEO);
 	return 0;
@@ -574,6 +692,7 @@ int gtk3_sdl_render(void)
 	int nesWidth  = GLX_NES_WIDTH;
 	int nesHeight = GLX_NES_HEIGHT;
 
+#ifdef _GTK
 	if ( (sdl_win_width != gtk_draw_area_width) || (sdl_win_height != gtk_draw_area_height) )
 	{
 		gtk3_sdl_resize();
@@ -587,6 +706,13 @@ int gtk3_sdl_render(void)
 	//printf(" %i x %i \n", nesWidth, nesHeight );
 	float xscale = (float)gtk_draw_area_width  / (float)nesWidth;
 	float yscale = (float)gtk_draw_area_height / (float)nesHeight;
+#else
+	SDL_GetRendererOutputSize(sdlRenderer, &sdl_win_width, &sdl_win_height);
+	nesWidth = NWIDTH;
+	nesHeight = s_tlines;
+	float xscale = (float)sdl_win_width / (float)nesWidth;
+	float yscale = (float)sdl_win_height / (float)nesHeight;
+#endif
 
 	if (xscale < yscale )
 	{
@@ -601,8 +727,13 @@ int gtk3_sdl_render(void)
 	rh=(int)(nesHeight*yscale);
 	//sx=sdlViewport.x + (view_width-rw)/2;   
 	//sy=sdlViewport.y + (view_height-rh)/2;
+#ifdef _GTK
 	sx=(gtk_draw_area_width-rw)/2;   
 	sy=(gtk_draw_area_height-rh)/2;
+#else
+	sx=(sdl_win_width-rw)/2;
+	sy=(sdl_win_height-rh)/2;
+#endif
 
 	if ( (sdlRenderer == NULL) || (sdlTexture == NULL) )
   	{
@@ -617,7 +748,11 @@ int gtk3_sdl_render(void)
 	int rowPitch;
 	SDL_LockTexture( sdlTexture, nullptr, (void**)&textureBuffer, &rowPitch);
 	{
+#ifdef _GTK
 		memcpy( textureBuffer, glx_shm->pixbuf, GLX_NES_HEIGHT*GLX_NES_WIDTH*sizeof(uint32_t) );
+#else
+		memcpy( textureBuffer, s_sdlPixbuf, GLX_NES_HEIGHT*GLX_NES_WIDTH*sizeof(uint32_t) );
+#endif
 	}
 	SDL_UnlockTexture(sdlTexture);
 

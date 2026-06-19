@@ -32,7 +32,7 @@ void *FCEU_amalloc(size_t size, size_t alignment)
 {
 	size = (size + alignment - 1) & ~(alignment-1);
 
-	#ifdef _MSC_VER
+	#ifdef WIN32
 	void *ret = _aligned_malloc(size,alignment);
 	#else
 	void *ret = aligned_alloc(alignment,size);
@@ -46,7 +46,7 @@ void *FCEU_amalloc(size_t size, size_t alignment)
 
 void FCEU_afree(void* ptr)
 {
-	#ifdef _MSC_VER
+	#ifdef WIN32
 	_aligned_free(ptr);
 	#else
 	free(ptr);

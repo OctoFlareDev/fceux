@@ -27,15 +27,17 @@
 #include "utils/memory.h"
 #include "Qt/nes_shm.h"
 #include "Qt/throttle.h"
+#include "sound.h"
 
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
 
 extern Config *g_config;
 extern bool turbo;
 
-static volatile int *s_Buffer = 0;
+static volatile uint32_t *s_Buffer = 0;
 static unsigned int s_BufferSize;
 static unsigned int s_BufferSize25;
 static unsigned int s_BufferSize50;
@@ -57,6 +59,21 @@ extern int EmulationPaused;
 extern double frmRateAdjRatio;
 extern double g_fpsScale;
 
+static inline uint32_t packStereo(int16 left, int16 right)
+{
+	return (uint16_t)left | ((uint32_t)(uint16_t)right << 16);
+}
+
+static inline int16 unpackLeft(uint32_t packed)
+{
+	return (int16)(packed & 0xFFFF);
+}
+
+static inline int16 unpackRight(uint32_t packed)
+{
+	return (int16)((packed >> 16) & 0xFFFF);
+}
+
 /**
  * Callback from the SDL to get and play audio data.
  */
@@ -66,11 +83,12 @@ fillaudio(void *udata,
 		int len)
 {
 	char bufStarveDetected = 0;
-	static int16_t sample = 0;
+	static int16 sampleLeft = 0;
+	static int16 sampleRight = 0;
 	char mute;
 	//unsigned int starve_lp = nes_shm->sndBuf.starveCounter;
 	int16 *tmps = (int16*)stream;
-	len >>= 1;
+	len >>= 2;
 
 	if ( s_BufferIn > s_BufferSize25 )
 	{
@@ -84,16 +102,24 @@ fillaudio(void *udata,
 	{
 		while ( len )
 		{
-			if ( sample > 0 )
+			if ( sampleLeft > 0 )
 			{
-				sample--;
+				sampleLeft--;
 			}
-			else if ( sample < 0 )
+			else if ( sampleLeft < 0 )
 			{
-				sample++;
+				sampleLeft++;
 			}
-			*tmps = sample;
-			tmps++;
+			if ( sampleRight > 0 )
+			{
+				sampleRight--;
+			}
+			else if ( sampleRight < 0 )
+			{
+				sampleRight++;
+			}
+			*tmps++ = sampleLeft;
+			*tmps++ = sampleRight;
 			len--;
 		}
 		noiseGate = 0.0;
@@ -133,20 +159,23 @@ fillaudio(void *udata,
 			}
 			if (s_BufferIn) 
 			{
-				sample = s_Buffer[s_BufferRead] * noiseGate;
+				uint32_t packed = s_Buffer[s_BufferRead];
+				sampleLeft = (int16)(unpackLeft(packed) * noiseGate);
+				sampleRight = (int16)(unpackRight(packed) * noiseGate);
 				s_BufferRead = (s_BufferRead + 1) % s_BufferSize;
 				s_BufferIn--;
 
-				*tmps = sample * noiseGate;
+				*tmps++ = (int16)(sampleLeft * noiseGate);
+				*tmps++ = (int16)(sampleRight * noiseGate);
 			}
 			else
 			{
          			// Retain last known sample value, helps avoid clicking
          			// noise when sound system is starved of audio data.
-				*tmps = sample * noiseGate;
+				*tmps++ = (int16)(sampleLeft * noiseGate);
+				*tmps++ = (int16)(sampleRight * noiseGate);
 			}
 
-			tmps++;
 			len--;
 		}
 	}
@@ -156,7 +185,9 @@ fillaudio(void *udata,
 		{
 			if (s_BufferIn) 
 			{
-				sample = s_Buffer[s_BufferRead];
+				uint32_t packed = s_Buffer[s_BufferRead];
+				sampleLeft = unpackLeft(packed);
+				sampleRight = unpackRight(packed);
 				s_BufferRead = (s_BufferRead + 1) % s_BufferSize;
 				s_BufferIn--;
 			} else {
@@ -167,10 +198,10 @@ fillaudio(void *udata,
 				nes_shm->sndBuf.starveCounter++;
 			}
 
-			nes_shm->push_sound_sample( sample );
+			nes_shm->push_sound_sample( ((int32)sampleLeft + (int32)sampleRight) / 2 );
 
-			*tmps = sample;
-			tmps++;
+			*tmps++ = sampleLeft;
+			*tmps++ = sampleRight;
 			len--;
 		}
 	}
@@ -247,7 +278,7 @@ InitSound()
 
 	spec.freq = s_SampleRate = soundrate;
 	spec.format = AUDIO_S16SYS;
-	spec.channels = 1;
+	spec.channels = 2;
 	spec.samples = 512; // This must stay a power of two per SDL documentation
 	spec.callback = fillaudio;
 	spec.userdata = 0;
@@ -277,7 +308,7 @@ InitSound()
 	noiseGateActive = true;
 	fillInit = 1;
 
-	s_Buffer = (int *)FCEU_dmalloc(sizeof(int) * s_BufferSize);
+	s_Buffer = (uint32_t *)FCEU_dmalloc(sizeof(uint32_t) * s_BufferSize);
 
 	if (!s_Buffer)
 	{
@@ -385,6 +416,7 @@ WriteSound(int32 *buf,
 	if (EmulationPaused == 0)
 	{
 		int waitCount = 0;
+		int frameIndex = 0;
 
 		if ( uflowMode )
 		{	// Underflow mode
@@ -407,9 +439,12 @@ WriteSound(int32 *buf,
 					SDL_LockAudio();
 				}
 
+				int16 left, right;
+				FCEU_NoteBlockStereoFrame(frameIndex, *buf, &left, &right);
+				uint32_t packed = packStereo(left, right);
 				for (int i=0; i<udrFlowDup; i++)
 				{
-					s_Buffer[s_BufferWrite] = *buf;
+					s_Buffer[s_BufferWrite] = packed;
 					s_BufferWrite = (s_BufferWrite + 1) % s_BufferSize;
             
 					s_BufferIn++;
@@ -417,6 +452,7 @@ WriteSound(int32 *buf,
             
 				Count--;
 				buf++;
+				frameIndex++;
 			}
 			SDL_UnlockAudio();
 		}
@@ -445,12 +481,15 @@ WriteSound(int32 *buf,
 						SDL_LockAudio();
 					}
 
-					s_Buffer[s_BufferWrite] = *buf;
+					int16 left, right;
+					FCEU_NoteBlockStereoFrame(frameIndex, *buf, &left, &right);
+					s_Buffer[s_BufferWrite] = packStereo(left, right);
 					Count--;
 					s_BufferWrite = (s_BufferWrite + 1) % s_BufferSize;
             
 					s_BufferIn++;
 					buf++;
+					frameIndex++;
 				}
 				SDL_UnlockAudio();
 			}
@@ -479,7 +518,9 @@ WriteSound(int32 *buf,
 
 					if ( skipCounter >= ovrFlowSkip )
 					{
-						s_Buffer[s_BufferWrite] = *buf;
+						int16 left, right;
+						FCEU_NoteBlockStereoFrame(frameIndex, *buf, &left, &right);
+						s_Buffer[s_BufferWrite] = packStereo(left, right);
 						s_BufferWrite = (s_BufferWrite + 1) % s_BufferSize;
             
 						s_BufferIn++;
@@ -490,6 +531,7 @@ WriteSound(int32 *buf,
             
 					Count--;
 					buf++;
+					frameIndex++;
 				}
 				SDL_UnlockAudio();
 			}

@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #include <semaphore.h>
+#include <cstring>
 
 int  spawn_glxwin( int flags );
 
